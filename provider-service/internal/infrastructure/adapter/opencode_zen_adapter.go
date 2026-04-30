@@ -3,7 +3,10 @@ package adapter
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"time"
 
+	"github.com/ai-api-gateway/provider-service/internal/domain/entity"
 	"github.com/ai-api-gateway/provider-service/internal/domain/port"
 )
 
@@ -61,22 +64,24 @@ func (a *OpenCodeZenAdapter) TransformRequest(request []byte, headers map[string
 	return transformedRequest, transformedHeaders, nil
 }
 
-// TransformResponse transforms OpenCode Zen format response back to OpenAI format
-func (a *OpenCodeZenAdapter) TransformResponse(response []byte) ([]byte, error) {
-	// Parse OpenCode Zen format response
+// TransformResponse transforms OpenCode Zen format response back to OpenAI format.
+//
+// For non-streaming: Pass-through (already OpenAI format) with token extraction
+// For streaming: Pass-through with token accumulation
+func (a *OpenCodeZenAdapter) TransformResponse(response []byte, isStreaming bool, accumulatedTokens entity.TokenCounts) ([]byte, entity.TokenCounts, bool, error) {
+	if !isStreaming {
+		return a.transformNonStreamingResponse(response, accumulatedTokens)
+	}
+
+	// For streaming, pass through and accumulate tokens
+	accumulatedTokens.AccumulatedTokens += int64(len(response) / 4)
+	return response, accumulatedTokens, false, nil
+}
+
+// transformNonStreamingResponse handles non-streaming response transformation
+func (a *OpenCodeZenAdapter) transformNonStreamingResponse(response []byte, accumulatedTokens entity.TokenCounts) ([]byte, entity.TokenCounts, bool, error) {
+	// Parse OpenCode Zen format response to extract token counts
 	var zenResp struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		Model   string `json:"model"`
-		Choices []struct {
-			Index   int `json:"index"`
-			Message struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
-			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
 		Usage struct {
 			PromptTokens     int64 `json:"prompt_tokens"`
 			CompletionTokens int64 `json:"completion_tokens"`
@@ -84,31 +89,62 @@ func (a *OpenCodeZenAdapter) TransformResponse(response []byte) ([]byte, error) 
 		} `json:"usage"`
 	}
 
-	if err := json.Unmarshal(response, &zenResp); err != nil {
-		return nil, fmt.Errorf("invalid OpenCode Zen response format: %w", err)
+	// Try to extract usage data, but don't fail if parsing fails
+	json.Unmarshal(response, &zenResp)
+
+	tokenCounts := entity.TokenCounts{
+		PromptTokens:      zenResp.Usage.PromptTokens,
+		CompletionTokens:  zenResp.Usage.CompletionTokens,
+		AccumulatedTokens: zenResp.Usage.TotalTokens,
 	}
 
 	// OpenCode Zen response is already in OpenAI format, so return as-is
-	return response, nil
+	return response, tokenCounts, true, nil
 }
 
-// CountTokens counts tokens in the request/response
-func (a *OpenCodeZenAdapter) CountTokens(request []byte, response []byte) (int64, int64, error) {
-	// Try to extract from response if available
-	var resp struct {
-		Usage struct {
-			PromptTokens     int64 `json:"prompt_tokens"`
-			CompletionTokens int64 `json:"completion_tokens"`
-		} `json:"usage"`
+// CountTokens counts tokens in the request/response.
+//
+// For non-streaming: Extract from response or estimate
+// For streaming: Return 0, 0 for intermediate chunks
+func (a *OpenCodeZenAdapter) CountTokens(request []byte, response []byte, isStreaming bool) (int64, int64, error) {
+	if !isStreaming {
+		// Try to extract from response if available
+		var resp struct {
+			Usage struct {
+				PromptTokens     int64 `json:"prompt_tokens"`
+				CompletionTokens int64 `json:"completion_tokens"`
+			} `json:"usage"`
+		}
+
+		if err := json.Unmarshal(response, &resp); err == nil {
+			return resp.Usage.PromptTokens, resp.Usage.CompletionTokens, nil
+		}
+
+		// Fallback to estimation
+		promptTokens := int64(len(request) / 4)
+		completionTokens := int64(len(response) / 4)
+		return promptTokens, completionTokens, nil
 	}
 
-	if err := json.Unmarshal(response, &resp); err == nil {
-		return resp.Usage.PromptTokens, resp.Usage.CompletionTokens, nil
+	// Streaming: return 0, 0 (tokens accumulated via TransformResponse)
+	return 0, 0, nil
+}
+
+func (a *OpenCodeZenAdapter) TestConnection(credentials string) error {
+	client := &http.Client{Timeout: 10 * time.Second}
+	url := "https://opencode.ai/zen/v1/models"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
 	}
-
-	// Fallback to estimation
-	promptTokens := int64(len(request) / 4)
-	completionTokens := int64(len(response) / 4)
-
-	return promptTokens, completionTokens, nil
+	req.Header.Set("Authorization", "Bearer "+credentials)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	return nil
 }

@@ -3,7 +3,10 @@ package adapter
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"time"
 
+	"github.com/ai-api-gateway/provider-service/internal/domain/entity"
 	"github.com/ai-api-gateway/provider-service/internal/domain/port"
 )
 
@@ -63,8 +66,22 @@ func (a *GeminiAdapter) TransformRequest(request []byte, headers map[string]stri
 	return transformedRequest, transformedHeaders, nil
 }
 
-// TransformResponse transforms Gemini format response back to OpenAI format
-func (a *GeminiAdapter) TransformResponse(response []byte) ([]byte, error) {
+// TransformResponse transforms Gemini format response back to OpenAI format.
+//
+// For non-streaming: Full response transformation with token extraction
+// For streaming: Pass-through with token accumulation
+func (a *GeminiAdapter) TransformResponse(response []byte, isStreaming bool, accumulatedTokens entity.TokenCounts) ([]byte, entity.TokenCounts, bool, error) {
+	if !isStreaming {
+		return a.transformNonStreamingResponse(response, accumulatedTokens)
+	}
+
+	// For streaming, pass through and accumulate tokens
+	accumulatedTokens.AccumulatedTokens += int64(len(response) / 4)
+	return response, accumulatedTokens, false, nil
+}
+
+// transformNonStreamingResponse handles non-streaming response transformation
+func (a *GeminiAdapter) transformNonStreamingResponse(response []byte, accumulatedTokens entity.TokenCounts) ([]byte, entity.TokenCounts, bool, error) {
 	// Parse Gemini format response
 	var geminiResp struct {
 		Candidates []struct {
@@ -84,12 +101,12 @@ func (a *GeminiAdapter) TransformResponse(response []byte) ([]byte, error) {
 	}
 
 	if err := json.Unmarshal(response, &geminiResp); err != nil {
-		return nil, fmt.Errorf("invalid Gemini response format: %w", err)
+		return nil, accumulatedTokens, false, fmt.Errorf("invalid Gemini response format: %w", err)
 	}
 
 	// Extract the first candidate's content
 	if len(geminiResp.Candidates) == 0 {
-		return nil, fmt.Errorf("no candidates in Gemini response")
+		return nil, accumulatedTokens, false, fmt.Errorf("no candidates in Gemini response")
 	}
 
 	content := ""
@@ -122,31 +139,44 @@ func (a *GeminiAdapter) TransformResponse(response []byte) ([]byte, error) {
 
 	transformedResponse, err := json.Marshal(openAIResp)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal OpenAI response: %w", err)
+		return nil, accumulatedTokens, false, fmt.Errorf("failed to marshal OpenAI response: %w", err)
 	}
 
-	return transformedResponse, nil
+	tokenCounts := entity.TokenCounts{
+		PromptTokens:      geminiResp.UsageMetadata.PromptTokenCount,
+		CompletionTokens:  geminiResp.UsageMetadata.CandidatesTokenCount,
+		AccumulatedTokens: geminiResp.UsageMetadata.TotalTokenCount,
+	}
+
+	return transformedResponse, tokenCounts, true, nil
 }
 
-// CountTokens counts tokens in the request/response
-func (a *GeminiAdapter) CountTokens(request []byte, response []byte) (int64, int64, error) {
-	// Try to extract from response if available
-	var resp struct {
-		UsageMetadata struct {
-			PromptTokenCount     int64 `json:"promptTokenCount"`
-			CandidatesTokenCount int64 `json:"candidatesTokenCount"`
-		} `json:"usageMetadata"`
+// CountTokens counts tokens in the request/response.
+//
+// For non-streaming: Extract from response or estimate
+// For streaming: Return 0, 0 for intermediate chunks
+func (a *GeminiAdapter) CountTokens(request []byte, response []byte, isStreaming bool) (int64, int64, error) {
+	if !isStreaming {
+		// Try to extract from response if available
+		var resp struct {
+			UsageMetadata struct {
+				PromptTokenCount     int64 `json:"promptTokenCount"`
+				CandidatesTokenCount int64 `json:"candidatesTokenCount"`
+			} `json:"usageMetadata"`
+		}
+
+		if err := json.Unmarshal(response, &resp); err == nil {
+			return resp.UsageMetadata.PromptTokenCount, resp.UsageMetadata.CandidatesTokenCount, nil
+		}
+
+		// Fallback to estimation
+		promptTokens := int64(len(request) / 4)
+		completionTokens := int64(len(response) / 4)
+		return promptTokens, completionTokens, nil
 	}
 
-	if err := json.Unmarshal(response, &resp); err == nil {
-		return resp.UsageMetadata.PromptTokenCount, resp.UsageMetadata.CandidatesTokenCount, nil
-	}
-
-	// Fallback to estimation
-	promptTokens := int64(len(request) / 4)
-	completionTokens := int64(len(response) / 4)
-
-	return promptTokens, completionTokens, nil
+	// Streaming: return 0, 0 (tokens accumulated via TransformResponse)
+	return 0, 0, nil
 }
 
 // convertMessagesToContents converts OpenAI messages to Gemini contents format
@@ -183,11 +213,11 @@ func (a *GeminiAdapter) convertMessagesToContents(messages []map[string]interfac
 // convertFinishReason converts Gemini finish reason to OpenAI format
 func (a *GeminiAdapter) convertFinishReason(reason string) string {
 	reasonMap := map[string]string{
-		"STOP":    "stop",
+		"STOP":       "stop",
 		"MAX_TOKENS": "length",
-		"SAFETY":  "content_filter",
+		"SAFETY":     "content_filter",
 		"RECITATION": "content_filter",
-		"OTHER":   "stop",
+		"OTHER":      "stop",
 	}
 
 	if openAIReason, ok := reasonMap[reason]; ok {
@@ -195,4 +225,18 @@ func (a *GeminiAdapter) convertFinishReason(reason string) string {
 	}
 
 	return reason
+}
+
+func (a *GeminiAdapter) TestConnection(credentials string) error {
+	client := &http.Client{Timeout: 10 * time.Second}
+	url := "https://generativelanguage.googleapis.com/v1/models?key=" + credentials
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	return nil
 }

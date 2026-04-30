@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ai-api-gateway/provider-service/internal/domain/entity"
 	"github.com/ai-api-gateway/provider-service/internal/domain/port"
 	"github.com/ai-api-gateway/provider-service/internal/infrastructure/crypto"
@@ -19,7 +20,7 @@ import (
 type Service struct {
 	providerRepo   port.ProviderRepository
 	adapterFactory *AdapterFactory
-	cryptoKey     string
+	cryptoKey      string // Encryption key for credential decryption
 	subscribers    map[string]string // service_name -> gRPC endpoint
 	subscribersMu  sync.RWMutex
 }
@@ -28,12 +29,12 @@ type Service struct {
 func NewService(
 	providerRepo port.ProviderRepository,
 	adapterFactory *AdapterFactory,
-	cryptoKey string,
+	cryptoKey string, // Encryption key for credential decryption
 ) *Service {
 	return &Service{
 		providerRepo:   providerRepo,
 		adapterFactory: adapterFactory,
-		cryptoKey:     cryptoKey,
+		cryptoKey:      cryptoKey,
 		subscribers:    make(map[string]string),
 	}
 }
@@ -90,19 +91,26 @@ func (s *Service) ForwardRequest(ctx context.Context, providerID string, request
 		return nil, 0, 0, 0, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Transform response back to OpenAI format
-	transformedResponse, err := adapter.TransformResponse(responseBody)
+	// Transform response back to OpenAI format (non-streaming)
+	transformedResponse, tokenCounts, _, err := adapter.TransformResponse(responseBody, false, entity.TokenCounts{})
 	if err != nil {
 		return nil, 0, 0, 0, fmt.Errorf("failed to transform response: %w", err)
 	}
 
-	// Count tokens
-	promptTokens, completionTokens, err := adapter.CountTokens(requestBody, transformedResponse)
-	if err != nil {
-		// Log error but don't fail the request
-		log.Printf("Failed to count tokens: %v", err)
-		promptTokens = 0
-		completionTokens = 0
+	// Use token counts from TransformResponse if available, otherwise fall back to CountTokens
+	promptTokens := tokenCounts.PromptTokens
+	completionTokens := tokenCounts.CompletionTokens
+	
+	if promptTokens == 0 && completionTokens == 0 {
+		// Fall back to explicit counting if TransformResponse didn't extract tokens
+		var err error
+		promptTokens, completionTokens, err = adapter.CountTokens(requestBody, transformedResponse, false)
+		if err != nil {
+			// Log error but don't fail the request
+			log.Printf("Failed to count tokens: %v", err)
+			promptTokens = 0
+			completionTokens = 0
+		}
 	}
 
 	// Dispatch callbacks asynchronously
@@ -324,11 +332,40 @@ func (s *Service) GetProvider(id string) (*entity.Provider, error) {
 
 // CreateProvider creates a new provider
 func (s *Service) CreateProvider(provider *entity.Provider) error {
+	existing, err := s.providerRepo.GetByName(provider.Name)
+	if err == nil && existing != nil {
+		return fmt.Errorf("provider with name %q already exists", provider.Name)
+	}
+	if provider.ID == "" {
+		provider.ID = uuid.New().String()
+	}
+	now := time.Now()
+	provider.CreatedAt = now
+	provider.UpdatedAt = now
+
+	if provider.Credentials != "" {
+		encrypted, err := crypto.Encrypt(provider.Credentials, s.cryptoKey)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt credentials: %w", err)
+		}
+		provider.Credentials = encrypted
+	}
+
 	return s.providerRepo.Create(provider)
 }
 
 // UpdateProvider updates an existing provider
 func (s *Service) UpdateProvider(provider *entity.Provider) error {
+	provider.UpdatedAt = time.Now()
+
+	if provider.Credentials != "" {
+		encrypted, err := crypto.Encrypt(provider.Credentials, s.cryptoKey)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt credentials: %w", err)
+		}
+		provider.Credentials = encrypted
+	}
+
 	return s.providerRepo.Update(provider)
 }
 
@@ -345,4 +382,27 @@ func (s *Service) ListProviders(page, pageSize int) ([]*entity.Provider, int, er
 // GetProviderByType retrieves a provider by type
 func (s *Service) GetProviderByType(providerType string) (*entity.Provider, error) {
 	return s.providerRepo.GetByType(providerType)
+}
+
+func (s *Service) HealthCheck(providerID string) (bool, error) {
+	provider, err := s.providerRepo.GetByID(providerID)
+	if err != nil {
+		return false, fmt.Errorf("failed to get provider: %w", err)
+	}
+
+	adapter, err := s.adapterFactory.GetAdapter(provider.Type)
+	if err != nil {
+		return false, fmt.Errorf("failed to get adapter: %w", err)
+	}
+
+	decryptedCreds, err := crypto.Decrypt(provider.Credentials, s.cryptoKey)
+	if err != nil {
+		return false, fmt.Errorf("failed to decrypt credentials: %w", err)
+	}
+
+	if err := adapter.TestConnection(decryptedCreds); err != nil {
+		return false, nil
+	}
+
+	return true, nil
 }
